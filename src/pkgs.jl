@@ -342,6 +342,19 @@ end
 const wplock = ReentrantLock()
 cache_timer = Ref{Union{Timer,Nothing}}(nothing)
 cache_task = Ref{Union{Task,Nothing}}(nothing)
+cache_needs_rerun = Ref{Bool}(false)
+
+function _cache(type=Any)
+    foreach_subtype(type) do @nospecialize t
+        yield()
+        fieldtypes_cached(t)
+    end
+    if cache_needs_rerun[]
+        cache_needs_rerun[] = false
+        # Start another task to re-populate the cache
+        cache_task[] = Threads.@spawn :default _cache(Any)
+    end
+end
 
 """
     watch_package(id::Base.PkgId)
@@ -382,14 +395,10 @@ function watch_package(id::PkgId)
             cache_timer[] = Timer(5.0) do timer
                 # Only start the task if one isn't already running
                 if isnothing(cache_task[]) || istaskdone(cache_task[])
-                    cache_task[] = Threads.@spawn :default foreach_subtype(Any) do @nospecialize type
-                        # Populating this cache can be time consuming (eg, 30s on an
-                        # i7-7700HQ) so do this incrementally and yield() to the scheduler
-                        # regularly so this thread gets a chance to exit if the user quits early
-                        yield()
-                        fieldtypes_cached(type)
-                    end
+                    cache_task[] = Threads.@spawn :default _cache(Any)
                     cache_timer[] = nothing
+                else
+                    cache_needs_rerun[] = true
                 end
             end
         end
