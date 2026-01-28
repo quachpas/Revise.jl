@@ -340,6 +340,8 @@ function watch_files_via_dir(dirname::AbstractString)
 end
 
 const wplock = ReentrantLock()
+cache_timer = Ref{Union{Timer,Nothing}}(nothing)
+cache_task = Ref{Union{Task,Nothing}}(nothing)
 
 """
     watch_package(id::Base.PkgId)
@@ -368,6 +370,29 @@ function watch_package(id::PkgId)
             init_watching(pkgdata, srcfiles(pkgdata))
         end
         @lock pkgdatas_lock pkgdatas[id] = pkgdata
+        # experimental: populate types_caches
+        # Use a timer to debounce rapid package loading and start at most one background task
+        @static if !(VERSION < v"1.13-" && Sys.isapple())
+            # Cancel existing timer if packages are still being loaded
+            if !isnothing(cache_timer[])
+                close(cache_timer[])
+            end
+
+            # Set a timer that fires after 1 second of no new package loads
+            cache_timer[] = Timer(5.0) do timer
+                # Only start the task if one isn't already running
+                if isnothing(cache_task[]) || istaskdone(cache_task[])
+                    cache_task[] = Threads.@spawn :default foreach_subtype(Any) do @nospecialize type
+                        # Populating this cache can be time consuming (eg, 30s on an
+                        # i7-7700HQ) so do this incrementally and yield() to the scheduler
+                        # regularly so this thread gets a chance to exit if the user quits early
+                        yield()
+                        fieldtypes_cached(type)
+                    end
+                    cache_timer[] = nothing
+                end
+            end
+        end
     end
     return pkgdata
 end
